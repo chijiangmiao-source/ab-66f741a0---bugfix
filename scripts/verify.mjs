@@ -153,7 +153,7 @@ async function main() {
   const files = [
     'server.js', 'src/parser.mjs', 'src/diagnoser.mjs',
     'src/analyze.mjs', 'src/worker.mjs', 'public/app.js',
-    'scripts/fuzz.mjs', 'scripts/verify.mjs',
+    'scripts/fuzz.mjs', 'scripts/verify.mjs', 'scripts/acceptance.mjs',
   ];
   for (const f of files) {
     const code = await run('node', ['--check', f]);

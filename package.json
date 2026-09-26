@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "acceptance": "node scripts/acceptance.mjs"
   },
   "engines": {
     "node": ">=20"

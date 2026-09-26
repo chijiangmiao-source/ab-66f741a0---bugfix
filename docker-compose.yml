@@ -1,5 +1,6 @@
-# docker compose up --build         启动审计页（web）并执行 verify（退出码可见）
+# docker compose up --build         启动审计页（web）并依次执行 verify、acceptance（退出码可见）
 # docker compose run --rm verify    只跑校验（静默双环/可诊断回执测试、构建检查、HTTP 冒烟）
+# docker compose run --rm acceptance 只跑并发/取消语义验收（真实 HTTP）
 services:
   web:
     build: .
@@ -28,5 +29,21 @@ services:
       # 对 web 服务做真实 HTTP 冒烟
       BASE_URL: "http://web:8080"
     entrypoint: ["node", "scripts/verify.mjs"]
+    # 执行完即退出，退出码原样返回（0 通过 / 非 0 失败），不重启
+    restart: "no"
+
+  acceptance:
+    build: .
+    image: deep-sea-diagnosability-audit:latest
+    depends_on:
+      web:
+        condition: service_healthy
+      # 与 verify 串行，避免并发请求干扰复核计数断言
+      verify:
+        condition: service_completed_successfully
+    environment:
+      # 对 web 服务做真实 HTTP 并发/取消验收
+      BASE_URL: "http://web:8080"
+    entrypoint: ["node", "scripts/acceptance.mjs"]
     # 执行完即退出，退出码原样返回（0 通过 / 非 0 失败），不重启
     restart: "no"
