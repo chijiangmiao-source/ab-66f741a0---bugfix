@@ -4,6 +4,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { BIG_SPEC } from './bigspec.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -142,6 +143,87 @@ trans n1 0 2 N a
   const h = await r.json();
   expect(h.activeJobs === 0, '取消/完成后无残留任务');
 
+  // 7) 并发共享 / 取消隔离 / 取消重提（大规程，真实 HTTP 交错）
+  console.log('\n[verify] === 并发与取消验收（相同规程大模型） ===');
+  const health = async () => (await (await fetch(`${base}/healthz`)).json());
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  const postSpec = (jobId, spec) => fetch(`${base}/api/analyze`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId, spec }),
+  }).then(async (x) => ({ status: x.status, json: await x.json() }));
+  const observeWhile = async (inFlight) => {
+    let maxJobs = 0;
+    let maxComputations = 0;
+    let done = false;
+    inFlight.then(() => { done = true; }, () => { done = true; });
+    while (!done) {
+      const hh = await health();
+      maxJobs = Math.max(maxJobs, hh.activeJobs);
+      maxComputations = Math.max(maxComputations, hh.activeComputations);
+      await sleep(25);
+    }
+    return { maxJobs, maxComputations };
+  };
+
+  // 7a) 两个并发页面提交内容完全相同的规程：两者均成功且结果一致，
+  //     且服务只执行一次实际复核
+  const h0 = await health();
+  const both = Promise.all([postSpec('par-a', BIG_SPEC), postSpec('par-b', BIG_SPEC)]);
+  const observed = await observeWhile(both);
+  const [pa, pb] = await both;
+  expect(pa.status === 200, '并发：首个页面收到裁决（200）');
+  expect(pb.status === 200, '并发：后一个页面也收到本次裁决（200，不再超时）');
+  expect(pa.json.result?.diagnosable === false, '并发：大规程判为不可诊断');
+  expect(JSON.stringify(pa.json.result) === JSON.stringify(pb.json.result),
+    '并发：两者裁决内容一致');
+  expect(observed.maxJobs === 2, `并发：计算期间观测到 2 个活动任务（实际 ${observed.maxJobs}）`);
+  expect(observed.maxComputations === 1,
+    `并发：在途相同规程只共享一次复核（实际 ${observed.maxComputations}）`);
+  let hNow = await health();
+  expect(hNow.computationsStarted - h0.computationsStarted === 1,
+    '并发：服务只执行了一次实际复核（computationsStarted +1）');
+  expect(hNow.activeJobs === 0 && hNow.activeComputations === 0,
+    '并发：完成后健康接口无残留活动任务');
+  const sharedResult = JSON.stringify(pa.json.result);
+
+  // 7b) 取消其中一个并发页面：另一个继续完成，互不影响
+  const keep = postSpec('keep-1', BIG_SPEC);
+  const drop = postSpec('drop-1', BIG_SPEC);
+  await sleep(150);
+  const dr = await fetch(`${base}/api/jobs/drop-1`, { method: 'DELETE' });
+  const dj = await dr.json();
+  expect(dr.status === 200 && dj.cancelled === true && dj.jobId === 'drop-1',
+    '取消：DELETE 响应确认取消（cancelled=true）');
+  const [kept, dropped] = await Promise.all([keep, drop]);
+  expect(dropped.status === 409 && /取消/.test(dropped.json.error ?? ''),
+    `取消：被取消的提交收到 409（实际 ${dropped.status}）`);
+  expect(kept.status === 200, '取消：另一并发请求不受影响，正常完成');
+  expect(JSON.stringify(kept.json.result) === sharedResult,
+    '取消：完成结果与并发组一致（判定确定）');
+  hNow = await health();
+  expect(hNow.activeJobs === 0 && hNow.activeComputations === 0,
+    '取消：完成后健康接口无残留活动任务');
+
+  // 7c) 取消后以原文本重新提交：启动并完成一次新的复核
+  const stale = postSpec('re-1', BIG_SPEC);
+  await sleep(150);
+  await fetch(`${base}/api/jobs/re-1`, { method: 'DELETE' });
+  const staleResp = await stale;
+  expect(staleResp.status === 409, '重提：被取消的首次提交收到 409');
+  const hMid = await health();
+  expect(hMid.activeJobs === 0 && hMid.activeComputations === 0,
+    '重提：取消后服务不遗留活动任务');
+  const again = await postSpec('re-2', BIG_SPEC);
+  expect(again.status === 200, '重提：相同文本重新提交正常完成（不再报已取消）');
+  expect(JSON.stringify(again.json.result) === sharedResult,
+    '重提：新复核结果与此前一致');
+  hNow = await health();
+  expect(hNow.computationsStarted - hMid.computationsStarted === 1,
+    '重提：启动了一次新的实际复核（computationsStarted +1）');
+  expect(hNow.activeJobs === 0 && hNow.activeComputations === 0,
+    '重提：完成后健康接口无残留活动任务');
+
   cancelJob?.('not-a-job'); // 覆盖取消不存在任务的路径
   if (server) await new Promise((r) => server.close(r));
   console.log(failures === 0 ? '\n[verify] HTTP 冒烟全部通过' : `\n[verify] HTTP 冒烟失败 ${failures} 处`);
@@ -153,7 +235,7 @@ async function main() {
   const files = [
     'server.js', 'src/parser.mjs', 'src/diagnoser.mjs',
     'src/analyze.mjs', 'src/worker.mjs', 'public/app.js',
-    'scripts/fuzz.mjs', 'scripts/verify.mjs',
+    'scripts/fuzz.mjs', 'scripts/verify.mjs', 'scripts/bigspec.mjs',
   ];
   for (const f of files) {
     const code = await run('node', ['--check', f]);

@@ -47,6 +47,12 @@ trans 迁移标识 源位置 目标位置 F|N 回执|SILENT
   迟到响应不可能改写当前草稿与结果；旧结果保留并标注“已过期”。
 - 服务端新任务携带 `supersedes`，先 `worker.terminate()` 旧 worker；
   另有 30s 超时终止。计算在 Worker 线程执行，不阻塞事件循环。
+- 内容完全相同的在途提交共享同一次实际复核（只启动一个 worker），每个提交仍按
+  自己的 jobId 获得一致裁决；取消/超时只摘除提交者本人，其余等待者不受影响，
+  最后一个等待者离开时才终止 worker——取消后以原文本重提会启动并完成一次新复核。
+- 健康接口 `GET /healthz` 返回 `activeJobs`（活动提交数）、`activeComputations`
+  （在途复核数）与 `computationsStarted`（累计复核数）；正常完成、异常、超时或
+  取消后均不遗留活动任务。
 
 ## 运行
 
@@ -73,21 +79,25 @@ docker compose run --rm verify
 2. 代码测试（`node --test`：静默双环、可诊断回执、防误报、解析定位、HTTP 集成）；
 3. 随机模型交叉验证（独立参照实现 2000 例 + SCC 等价核对）；
 4. HTTP 冒烟：健康检查、静默双环判不可诊断且证据完整、可诊断回执判可诊断、
-   悬空目标定位、静态资源、取消竞速无 5xx 且无残留任务。
+   悬空目标定位、静态资源、取消竞速无 5xx 且无残留任务；
+   并发与取消验收（大规程）：两个并发相同规程均成功且结果一致、服务只执行一次
+   实际复核；取消其中一个并发请求不影响另一个完成；取消后以原文本重提可完成
+   新复核；核对取消响应、成功结果与健康接口活动任务计数。
 
 任一步失败即以非零退出码退出。本地等价命令：`npm run verify`。
 
 ## 目录
 
 ```
-server.js            HTTP 服务 + 任务/取消管理
+server.js            HTTP 服务 + 任务/取消管理（相同在途规程共享一次复核）
 src/parser.mjs       规程解析与行列级错误定位
 src/diagnoser.mjs    verifier 构造、SCC、稳定证据提取
 src/analyze.mjs      视图模型（序列一致性核验）
 src/worker.mjs       Worker 线程判定
 public/              审计页前端
-test/                单元与 HTTP 集成测试
+test/                单元与 HTTP 集成测试（含并发共享/取消/重提）
 scripts/fuzz.mjs     随机模型交叉验证
+scripts/bigspec.mjs  确定性大规程生成（并发/取消验收用）
 scripts/verify.mjs   verify 服务入口
 Dockerfile, docker-compose.yml
 ```

@@ -4,13 +4,13 @@ import { analyze } from './analyze.mjs';
 
 parentPort.on('message', (msg) => {
   if (msg?.type !== 'run') return;
-  const computationId = String(msg.computationId ?? msg.jobId);
+  const computationId = String(msg.computationId ?? '');
   try {
     const result = analyze(msg.spec);
-    parentPort.postMessage({ type: 'result', jobId: msg.jobId, computationId, result });
+    parentPort.postMessage({ type: 'result', computationId, result });
   } catch (err) {
     parentPort.postMessage({
-      type: 'error', jobId: msg.jobId, computationId,
+      type: 'error', computationId,
       error: { message: String(err?.message ?? err) },
     });
   }

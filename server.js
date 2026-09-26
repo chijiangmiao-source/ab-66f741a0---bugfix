@@ -19,41 +19,86 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
-// 活动判定任务：jobId -> { worker, finished }
+// 活动判定任务：jobId -> { shared, finished, timer, resolve, reject }
 const jobs = new Map();
+// 进行中的复核计算：spec -> shared。内容相同的在途提交共享同一次实际复核，
+// 每个提交仍按自己的 jobId 获得裁决；任一等待者取消/超时只摘除自身，
+// 最后一个等待者离开时才终止 worker，不留孤儿计算。
 const sharedRuns = new Map();
+let computationSeq = 0;
+let computationsStarted = 0; // 累计启动的实际复核次数（/healthz 可观测）
 
-function forgetSharedRun(spec, shared) {
-  if (sharedRuns.get(spec) === shared) sharedRuns.delete(spec);
+function forgetSharedRun(shared) {
+  if (sharedRuns.get(shared.spec) === shared) sharedRuns.delete(shared.spec);
 }
 
-function joinSharedRun(jobId, shared) {
-  return new Promise((resolve, reject) => {
-    const rec = { worker: shared.worker, finished: false, reject, shared };
-    jobs.set(jobId, rec);
-    const timer = setTimeout(() => {
-      if (!rec.finished) {
-        rec.finished = true;
-        jobs.delete(jobId);
-        reject(Object.assign(new Error('计算超时（30s），任务已取消'), { statusCode: 409 }));
-      }
-    }, 30_000);
-    shared.worker.on('message', (msg) => {
-      if (rec.finished || msg.jobId !== jobId) return;
-      rec.finished = true;
-      clearTimeout(timer);
-      jobs.delete(jobId);
-      if (msg.type === 'result') resolve(msg.result);
-      else reject(new Error(msg.error?.message ?? '判定失败'));
-    });
-    shared.worker.on('error', (err) => {
-      if (rec.finished) return;
-      rec.finished = true;
-      clearTimeout(timer);
-      jobs.delete(jobId);
-      reject(err);
-    });
+// 结束一次共享复核：摘除登记并终止 worker（幂等）
+function finishSharedRun(shared) {
+  if (shared.finished) return;
+  shared.finished = true;
+  forgetSharedRun(shared);
+  shared.worker.terminate();
+}
+
+// 结算单个任务：从 jobs 与所属共享复核中摘除并落地结果；
+// 该复核已无任何等待者时立即终止，不遗留活动任务
+function settleJob(rec, err, result) {
+  if (rec.finished) return;
+  rec.finished = true;
+  clearTimeout(rec.timer);
+  jobs.delete(rec.jobId);
+  const { shared } = rec;
+  shared.members.delete(rec.jobId);
+  if (err) rec.reject(err); else rec.resolve(result);
+  if (!shared.finished && shared.members.size === 0) finishSharedRun(shared);
+}
+
+// 复核失败（worker 错误/异常退出）：所有等待者一并结算
+function failSharedRun(shared, err) {
+  const members = [...shared.members.values()];
+  finishSharedRun(shared);
+  for (const rec of members) settleJob(rec, err);
+}
+
+function startSharedRun(spec) {
+  const worker = new Worker(join(__dirname, 'src', 'worker.mjs'));
+  const shared = {
+    spec,
+    worker,
+    computationId: `c${++computationSeq}`,
+    finished: false,
+    members: new Map(), // jobId -> rec（共享本次复核的全部提交）
+  };
+  sharedRuns.set(spec, shared);
+  computationsStarted++;
+  worker.on('message', (msg) => {
+    // 过期/陌生回执一律丢弃
+    if (shared.finished || msg?.computationId !== shared.computationId) return;
+    const err = msg.type === 'result'
+      ? null
+      : new Error(msg.error?.message ?? '判定失败');
+    const members = [...shared.members.values()];
+    finishSharedRun(shared);
+    // 同一次实际复核的裁决派发给共享它的每一个提交
+    for (const rec of members) settleJob(rec, err, msg.result);
   });
+  worker.on('error', (err) => failSharedRun(shared, err));
+  worker.on('exit', (code) => {
+    if (!shared.finished) {
+      failSharedRun(shared, new Error(`判定线程异常退出（code ${code}）`));
+    }
+  });
+  worker.postMessage({ type: 'run', computationId: shared.computationId, spec });
+  return shared;
+}
+
+function joinSharedRun(jobId, shared, resolve, reject) {
+  const rec = { jobId, shared, finished: false, resolve, reject, timer: null };
+  rec.timer = setTimeout(() => {
+    settleJob(rec, Object.assign(new Error('计算超时（30s），任务已取消'), { statusCode: 409 }));
+  }, 30_000);
+  jobs.set(jobId, rec);
+  shared.members.set(jobId, rec);
 }
 
 function runJob(jobId, spec, { useWorker = true } = {}) {
@@ -62,60 +107,19 @@ function runJob(jobId, spec, { useWorker = true } = {}) {
       try { resolve(analyze(spec)); } catch (e) { reject(e); }
       return;
     }
-    const existing = sharedRuns.get(spec);
-    if (existing && !existing.finished) {
-      resolve(joinSharedRun(jobId, existing));
-      return;
-    }
-    const worker = new Worker(join(__dirname, 'src', 'worker.mjs'));
-    const shared = { worker, finished: false, computationId: `c${jobId}` };
-    const rec = { worker, finished: false, reject, shared };
-    jobs.set(jobId, rec);
-    sharedRuns.set(spec, shared);
-    const timer = setTimeout(() => {
-      if (!rec.finished) {
-        rec.finished = true;
-        worker.terminate();
-        jobs.delete(jobId);
-        shared.finished = true;
-        forgetSharedRun(spec, shared);
-        reject(Object.assign(new Error('计算超时（30s），任务已取消'), { statusCode: 409 }));
-      }
-    }, 30_000);
-    worker.on('message', (msg) => {
-      if (rec.finished || msg.jobId !== jobId) return; // 过期/陌生回执一律丢弃
-      rec.finished = true;
-      clearTimeout(timer);
-      jobs.delete(jobId);
-      worker.terminate();
-      shared.finished = true;
-      forgetSharedRun(spec, shared);
-      if (msg.type === 'result') resolve(msg.result);
-      else reject(new Error(msg.error?.message ?? '判定失败'));
-    });
-    worker.on('error', (err) => {
-      if (rec.finished) return;
-      rec.finished = true;
-      clearTimeout(timer);
-      jobs.delete(jobId);
-      shared.finished = true;
-      forgetSharedRun(spec, shared);
-      reject(err);
-    });
-    worker.postMessage({ type: 'run', jobId, computationId: shared.computationId, spec });
+    // 内容相同的在途复核：直接共享其计算，不重复启动 worker
+    let shared = sharedRuns.get(spec);
+    if (!shared || shared.finished) shared = startSharedRun(spec);
+    joinSharedRun(jobId, shared, resolve, reject);
   });
 }
 
 function cancelJob(jobId) {
   const rec = jobs.get(jobId);
-  if (rec && !rec.finished) {
-    rec.finished = true;
-    rec.worker.terminate(); // 过期任务立即停止，不可能再回写任何结果
-    jobs.delete(jobId);
-    rec.reject(Object.assign(new Error('任务已被新规程取代或取消'), { statusCode: 409 }));
-    return true;
-  }
-  return false;
+  if (!rec || rec.finished) return false;
+  // 只摘除本任务；其余等待者继续共享复核，最后离开者才终止 worker
+  settleJob(rec, Object.assign(new Error('任务已被新规程取代或取消'), { statusCode: 409 }));
+  return true;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -127,6 +131,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         status: 'ok',
         activeJobs: jobs.size,
+        activeComputations: sharedRuns.size,
+        computationsStarted,
         uptime: Math.round(process.uptime()),
       }));
       return;
