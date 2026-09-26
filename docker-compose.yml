@@ -1,0 +1,32 @@
+# docker compose up --build         启动审计页（web）并执行 verify（退出码可见）
+# docker compose run --rm verify    只跑校验（静默双环/可诊断回执测试、构建检查、HTTP 冒烟）
+services:
+  web:
+    build: .
+    image: deep-sea-diagnosability-audit:latest
+    ports:
+      # 宿主机端口可调：APP_PORT=9090 docker compose up
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: deep-sea-diagnosability-audit:latest
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      # 对 web 服务做真实 HTTP 冒烟
+      BASE_URL: "http://web:8080"
+    entrypoint: ["node", "scripts/verify.mjs"]
+    # 执行完即退出，退出码原样返回（0 通过 / 非 0 失败），不重启
+    restart: "no"

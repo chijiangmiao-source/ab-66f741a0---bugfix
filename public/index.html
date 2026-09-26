@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>深海采集站 · 故障闭环审计</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header>
+  <h1>深海采集站 · 故障闭环审计</h1>
+  <p class="sub">
+    判定是否存在<strong>已发生故障的无限执行</strong>与<strong>从未发生故障的无限执行</strong>，
+    其可观察回执序列逐元素完全相同（静默迁移不产生回执，按 verifier / twin-plant 精确构造，不做有限回放）。
+  </p>
+</header>
+
+<main>
+  <section class="editor-pane">
+    <div class="pane-head">
+      <h2>规程录入</h2>
+      <div class="hint">
+        <code>loc 位置</code> · <code>init 初始位置</code> ·
+        <code>trans 标识 源 目标 F|N 回执|SILENT</code>（# 注释）
+      </div>
+    </div>
+    <div class="editor" id="editor">
+      <div class="gutter" id="gutter"></div>
+      <textarea id="spec" spellcheck="false" rows="22"></textarea>
+    </div>
+    <div class="toolbar">
+      <button id="submit" type="button">提交判定</button>
+      <button id="cancel" type="button" disabled>取消计算</button>
+      <span id="dirty" class="dirty-flag" hidden>规程已修改 · 当前结果可能过期</span>
+      <span class="spacer"></span>
+      <button class="linklike" id="load-silent" type="button">示例：静默双环（不可诊断）</button>
+      <button class="linklike" id="load-diag" type="button">示例：可诊断回执</button>
+    </div>
+    <div id="errors" class="errors" hidden></div>
+  </section>
+
+  <section class="result-pane">
+    <div class="pane-head"><h2>裁决</h2></div>
+    <div id="status" class="status idle">尚未提交</div>
+    <div id="result"></div>
+  </section>
+</main>
+
+<footer>
+  <span>端口可用 <code>PORT</code> 环境变量调整 · 健康检查 <code>/healthz</code></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
